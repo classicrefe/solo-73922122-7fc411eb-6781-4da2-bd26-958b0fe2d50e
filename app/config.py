@@ -2,11 +2,20 @@
 
 Layout under ``RAIN_DATA_DIR`` (default ``/data``)::
 
-    rainfall.db                  SQLite metadata / revision ledger
-    partitions/YYYY-MM-DD.parquet   published, immutable-after-replace files
-    tmp/inputs/YYYY-MM-DD-rN.csv    accepted raw uploads (audit trail)
-    tmp/work/<rev>.arrow            cleaned Arrow IPC intermediate
-    tmp/parquet/<rev>.parquet       encoded file, staged before atomic swap
+    rainfall.db                         SQLite metadata / revision ledger
+    partitions/YYYY-MM-DD-rev<id>.parquet
+                                        immutable per-revision partition files;
+                                        the publication row points at exactly one
+    tmp/inputs/YYYY-MM-DD-rN.csv        accepted raw uploads (audit trail, also
+                                        the source recovery rebuilds from)
+    tmp/work/<rev>.arrow                cleaned Arrow IPC intermediate
+    tmp/parquet/<rev>.parquet           encoded file, staged before the rename
+
+Legacy layout (pre immutable-files, still migrated at startup)::
+
+    partitions/YYYY-MM-DD.parquet       single live path, swapped in place
+    tmp/parquet/rollback-<date>-r<seq>.parquet
+                                        pre-swap backup of the live file
 """
 
 from __future__ import annotations
@@ -45,7 +54,18 @@ class Settings:
             p.mkdir(parents=True, exist_ok=True)
         return s
 
-    def partition_path(self, date: str) -> Path:
+    def partition_path(self, date: str, revision_id: int) -> Path:
+        """Immutable published file of one revision.
+
+        Every revision publishes under its own name; the publication row in
+        the ledger is the only pointer that ever changes, so a crash between
+        the file rename and the ledger commit can never corrupt what
+        downloads serve.
+        """
+        return self.partition_dir / f"{date}-rev{revision_id}.parquet"
+
+    def legacy_partition_path(self, date: str) -> Path:
+        """Single live path used by the pre-immutable-layout version."""
         return self.partition_dir / f"{date}.parquet"
 
     def input_path(self, date: str, seq: int) -> Path:

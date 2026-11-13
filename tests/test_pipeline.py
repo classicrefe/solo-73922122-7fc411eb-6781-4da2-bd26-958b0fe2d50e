@@ -7,20 +7,32 @@ import io
 import json
 import os
 import socket
+import sqlite3
 import subprocess
 import sys
 import time
 import urllib.error
 import urllib.request
 from contextlib import contextmanager
+from datetime import datetime
 from pathlib import Path
 
+import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
 from conftest import DAY, GOOD_ROWS, make_csv, upload, wait_status
 
 ROOT = Path(__file__).resolve().parents[1]
+
+CORRECTED_ROWS = [
+    ("ST001", f"{DAY}T00:00:00Z", 0),
+    ("ST001", f"{DAY}T01:00:00Z", 99),  # corrected: 9.9 mm
+    ("ST002", f"{DAY}T00:00:00Z", 5),
+    ("ST002", f"{DAY}T01:00:00Z", 210),
+]
+GOOD_MM = [0.0, 1.2, 0.5, 21.0]
+CORRECTED_MM = [0.0, 9.9, 0.5, 21.0]
 
 
 # --------------------------------------------------------------- environment
@@ -82,41 +94,91 @@ def _multipart(boundary: str, filename: str, content: bytes) -> bytes:
     ).encode() + content + f"\r\n--{boundary}--\r\n".encode()
 
 
+class Server:
+    """Restartable real-server harness for crash/recovery tests."""
+
+    def __init__(self, tmp_path: Path, demo_delay: str = "0"):
+        self.data_dir = tmp_path / "data"
+        self.port = _free_port()
+        self.demo_delay = demo_delay
+        self.proc: subprocess.Popen | None = None
+        self.base = f"http://127.0.0.1:{self.port}"
+        self._log = tmp_path / "server.log"
+
+    def start(self) -> None:
+        env = {
+            **os.environ,
+            "RAIN_DATA_DIR": str(self.data_dir),
+            "RAIN_DEMO_DELAY": self.demo_delay,
+            "RAIN_ENABLE_SHUTDOWN": "1",
+            "PYTHONPATH": str(ROOT),
+        }
+        self._log_handle = open(self._log, "ab")  # noqa: SIM115 - closed in stop()
+        self.proc = subprocess.Popen(
+            [sys.executable, "-m", "uvicorn", "app.main:app", "--port", str(self.port)],
+            cwd=str(ROOT),
+            env=env,
+            stdout=self._log_handle,
+            stderr=subprocess.STDOUT,
+        )
+        try:
+            _wait_health(self.base)
+        except Exception:
+            self.stop()
+            raise
+
+    def stop(self) -> None:
+        if self.proc is not None and self.proc.poll() is None:
+            with contextlib.suppress(OSError):
+                _http("POST", f"{self.base}/test/shutdown")
+            try:
+                self.proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                with contextlib.suppress(PermissionError, ProcessLookupError):
+                    self.proc.kill()
+                with contextlib.suppress(Exception):
+                    self.proc.wait(timeout=5)
+        self.proc = None
+        with contextlib.suppress(Exception):
+            self._log_handle.close()
+
+    def expect_exit(self, timeout: float = 30.0) -> int:
+        """Wait for the armed hard crash to kill the server process."""
+        assert self.proc is not None
+        return self.proc.wait(timeout=timeout)
+
+
 @contextmanager
 def server(tmp_path, demo_delay: str = "0.7"):
     """Real uvicorn process against an isolated data dir."""
-    data_dir = tmp_path / "data"
-    port = _free_port()
-    env = {
-        **os.environ,
-        "RAIN_DATA_DIR": str(data_dir),
-        "RAIN_DEMO_DELAY": demo_delay,
-        "RAIN_ENABLE_SHUTDOWN": "1",
-        "PYTHONPATH": str(ROOT),
-    }
-    proc = subprocess.Popen(
-        [sys.executable, "-m", "uvicorn", "app.main:app", "--port", str(port)],
-        cwd=str(ROOT),
-        env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-    )
-    base = f"http://127.0.0.1:{port}"
+    srv = Server(tmp_path, demo_delay=demo_delay)
+    srv.start()
     try:
-        _wait_health(base)
-        yield base
+        yield srv.base
     finally:
-        # Prefer the in-process self-shutdown (works where os.kill is blocked);
-        # fall back to signals where permitted.
-        with contextlib.suppress(OSError):
-            _http("POST", f"{base}/test/shutdown")
-        try:
-            proc.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            with contextlib.suppress(PermissionError, ProcessLookupError):
-                proc.kill()
-            with contextlib.suppress(Exception):
-                proc.wait(timeout=5)
+        srv.stop()
+
+
+def _rain_mm(parquet_bytes: bytes) -> list[float]:
+    return pq.read_table(io.BytesIO(parquet_bytes)).to_pydict()["rain_mm"]
+
+
+def _partition_names(data_dir: Path) -> set[str]:
+    return {p.name for p in (data_dir / "partitions").iterdir() if p.is_file()}
+
+
+def _set_paused(data_dir: Path, paused: bool) -> None:
+    """Flip the pause switch directly in the ledger while the server is down."""
+    conn = sqlite3.connect(data_dir / "rainfall.db")
+    try:
+        conn.execute(
+            "INSERT INTO pipeline_state(key, value) VALUES('paused', ?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            ("1" if paused else "0",),
+        )
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def _wait_terminal(base: str, date: str, timeout: float = 25.0) -> dict:
@@ -493,3 +555,384 @@ def test_recovery_discards_stale_superseded_revisions(tmp_path):
         except subprocess.TimeoutExpired:
             with contextlib.suppress(PermissionError, ProcessLookupError):
                 proc.kill()
+
+
+# ------------------------------------------------------- crash-point demos
+def test_crash_before_publish_commit_restart_still_serves_old_partition(tmp_path):
+    """Exit after the file rename but before the publication commit.
+
+    After the restart — and until the recomputation of the interrupted
+    revision finishes — downloads must keep serving the previous partition,
+    exactly matching the still-current publication row.
+    """
+    srv = Server(tmp_path, demo_delay="0.2")
+    srv.start()
+    try:
+        code, out = _http(
+            "POST", f"{srv.base}/uploads/{DAY}",
+            _multipart("b", "v1.csv", make_csv(GOOD_ROWS)),
+            {"Content-Type": "multipart/form-data; boundary=b"},
+        )
+        assert code == 202, out
+        rev1 = json.loads(out)["revision_id"]
+        _wait_terminal(srv.base, DAY)
+        old_bytes = _http("GET", f"{srv.base}/download/{DAY}")[1]
+        assert _rain_mm(old_bytes) == GOOD_MM
+
+        armed = json.loads(
+            _http("POST", f"{srv.base}/admin/crash/arm?point=before_publish_commit")[1]
+        )
+        assert armed["armed"] is True
+        code, out = _http(
+            "POST", f"{srv.base}/uploads/{DAY}",
+            _multipart("b", "v2.csv", make_csv(CORRECTED_ROWS)),
+            {"Content-Type": "multipart/form-data; boundary=b"},
+        )
+        assert code == 202, out
+        rev2 = json.loads(out)["revision_id"]
+        assert srv.expect_exit() == 1  # hard exit mid publish switch
+    finally:
+        srv.stop()
+
+    # Freeze the pipeline while the server is down so the recovery window is
+    # deterministic: recomputation is re-queued but blocked at the paused gate.
+    _set_paused(srv.data_dir, True)
+    srv.start()
+    try:
+        status = json.loads(_http("GET", f"{srv.base}/status/{DAY}")[1])
+        assert status["paused"] is True
+        # The publication row still points at rev1 and downloads serve exactly
+        # that — the never-committed rev2 bytes must not leak.
+        dl = _http("GET", f"{srv.base}/download/{DAY}")
+        assert dl[0] == 200
+        assert dl[1] == old_bytes
+        assert status["current_publication"]["revision_id"] == rev1
+        assert status["latest_task"]["revision_id"] == rev2
+        assert status["latest_task"]["status"] not in ("published", "failed")
+        # The orphaned, never-committed file was garbage-collected at startup.
+        assert _partition_names(srv.data_dir) == {f"{DAY}-rev{rev1}.parquet"}
+
+        assert json.loads(_http("POST", f"{srv.base}/admin/resume")[1])["paused"] is False
+        final = _wait_terminal(srv.base, DAY)
+        assert final["latest_task"]["status"] == "published"
+        assert final["current_publication"]["revision_id"] == rev2
+        new_bytes = _http("GET", f"{srv.base}/download/{DAY}")[1]
+        assert new_bytes != old_bytes
+        assert _rain_mm(new_bytes) == CORRECTED_MM
+        # The superseded rev1 file was retired after the commit.
+        assert _partition_names(srv.data_dir) == {f"{DAY}-rev{rev2}.parquet"}
+    finally:
+        srv.stop()
+
+
+def test_crash_after_publish_commit_restart_keeps_new_partition(tmp_path):
+    """Exit right after the publication commit: the switch must stick.
+
+    The restarted service keeps serving the new partition; there is no
+    rollback to the previous one and nothing is re-queued.
+    """
+    srv = Server(tmp_path, demo_delay="0.2")
+    srv.start()
+    try:
+        code, out = _http(
+            "POST", f"{srv.base}/uploads/{DAY}",
+            _multipart("b", "v1.csv", make_csv(GOOD_ROWS)),
+            {"Content-Type": "multipart/form-data; boundary=b"},
+        )
+        assert code == 202, out
+        rev1 = json.loads(out)["revision_id"]
+        _wait_terminal(srv.base, DAY)
+        old_bytes = _http("GET", f"{srv.base}/download/{DAY}")[1]
+
+        armed = json.loads(
+            _http("POST", f"{srv.base}/admin/crash/arm?point=after_publish_commit")[1]
+        )
+        assert armed["armed"] is True
+        code, out = _http(
+            "POST", f"{srv.base}/uploads/{DAY}",
+            _multipart("b", "v2.csv", make_csv(CORRECTED_ROWS)),
+            {"Content-Type": "multipart/form-data; boundary=b"},
+        )
+        assert code == 202, out
+        rev2 = json.loads(out)["revision_id"]
+        assert srv.expect_exit() == 1
+    finally:
+        srv.stop()
+
+    srv.start()
+    try:
+        dl = _http("GET", f"{srv.base}/download/{DAY}")
+        assert dl[0] == 200
+        assert dl[1] != old_bytes
+        assert _rain_mm(dl[1]) == CORRECTED_MM
+        status = json.loads(_http("GET", f"{srv.base}/status/{DAY}")[1])
+        assert status["current_publication"]["revision_id"] == rev2
+        assert status["latest_task"]["revision_id"] == rev2
+        assert status["latest_task"]["status"] == "published"
+        assert status["worker_active"] is False
+        # The crash happened before the old file was retired; startup GC
+        # removed the orphan and must not have touched the live file.
+        assert _partition_names(srv.data_dir) == {f"{DAY}-rev{rev2}.parquet"}
+        # Stable: nothing gets re-queued or reverted behind our back.
+        time.sleep(1.0)
+        status = json.loads(_http("GET", f"{srv.base}/status/{DAY}")[1])
+        assert status["latest_task"]["status"] == "published"
+        assert _rain_mm(_http("GET", f"{srv.base}/download/{DAY}")[1]) == CORRECTED_MM
+        assert rev1 != rev2
+    finally:
+        srv.stop()
+
+
+# ------------------------------------------- legacy data-dir/SQLite migration
+LEGACY_SCHEMA = """
+CREATE TABLE IF NOT EXISTS revisions (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    date            TEXT NOT NULL,
+    seq             INTEGER NOT NULL,
+    status          TEXT NOT NULL,
+    stage           TEXT NOT NULL DEFAULT 'queued',
+    error           TEXT,
+    source_filename TEXT NOT NULL,
+    input_path      TEXT NOT NULL,
+    row_count       INTEGER NOT NULL DEFAULT 0,
+    created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    updated_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    UNIQUE(date, seq)
+);
+CREATE TABLE IF NOT EXISTS publications (
+    date              TEXT PRIMARY KEY,
+    revision_id       INTEGER NOT NULL REFERENCES revisions(id),
+    partition_path    TEXT NOT NULL,
+    row_count         INTEGER NOT NULL,
+    published_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+CREATE TABLE IF NOT EXISTS revision_events (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    revision_id INTEGER NOT NULL REFERENCES revisions(id),
+    event       TEXT NOT NULL,
+    detail      TEXT,
+    created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+CREATE TABLE IF NOT EXISTS pipeline_state (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+"""
+
+
+def _write_partition(path: Path, rows: list[tuple[str, str, int]]) -> None:
+    """Write a partition file the way the pipeline would (tenth-mm -> mm)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    table = pa.table(
+        {
+            "station": pa.array([r[0] for r in rows], type=pa.string()),
+            "utc_hour": pa.array(
+                [datetime.fromisoformat(r[1].replace("Z", "+00:00")) for r in rows],
+                type=pa.timestamp("us", tz="UTC"),
+            ),
+            "rain_mm": pa.array([r[2] / 10.0 for r in rows], type=pa.float64()),
+        }
+    )
+    pq.write_table(table, path, compression="zstd")
+
+
+def _legacy_data_dir(
+    data_dir: Path,
+    *,
+    revisions: list[tuple],
+    publication: tuple,
+    live_rows: list | None,
+    rollback_rows: list | None,
+    rollback_seq: int = 2,
+    paused: bool = True,
+) -> None:
+    """Build a data dir + SQLite ledger as the old in-place-swap code left it.
+
+    ``live_rows``     : content of ``partitions/<date>.parquet`` (None = missing)
+    ``rollback_rows`` : content of ``tmp/parquet/rollback-<date>-r<seq>.parquet``
+    """
+    for sub in ("partitions", "tmp/inputs", "tmp/work", "tmp/parquet"):
+        (data_dir / sub).mkdir(parents=True, exist_ok=True)
+    legacy_path = data_dir / "partitions" / f"{DAY}.parquet"
+    if live_rows is not None:
+        _write_partition(legacy_path, live_rows)
+    if rollback_rows is not None:
+        _write_partition(
+            data_dir / "tmp" / "parquet" / f"rollback-{DAY}-r{rollback_seq}.parquet",
+            rollback_rows,
+        )
+    for (_id, _date, seq, *_rest) in revisions:
+        (data_dir / "tmp" / "inputs" / f"{_date}-r{seq}.csv").write_bytes(
+            make_csv(GOOD_ROWS if seq == 1 else CORRECTED_ROWS)
+        )
+
+    conn = sqlite3.connect(data_dir / "rainfall.db")
+    try:
+        conn.executescript(LEGACY_SCHEMA)
+        for (rev_id, date, seq, status, stage) in revisions:
+            conn.execute(
+                "INSERT INTO revisions(id, date, seq, status, stage, "
+                "source_filename, input_path, row_count) VALUES (?,?,?,?,?,?,?,?)",
+                (
+                    rev_id,
+                    date,
+                    seq,
+                    status,
+                    stage,
+                    f"r{seq}.csv",
+                    str(data_dir / "tmp" / "inputs" / f"{date}-r{seq}.csv"),
+                    4,
+                ),
+            )
+        conn.execute(
+            "INSERT INTO publications(date, revision_id, partition_path, row_count) "
+            "VALUES (?,?,?,?)",
+            (publication[0], publication[1], str(legacy_path), publication[2]),
+        )
+        if paused:
+            conn.execute("INSERT INTO pipeline_state(key, value) VALUES('paused','1')")
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_legacy_window_renamed_not_committed_is_restored(tmp_path):
+    """Old code crashed after the rename, before the commit.
+
+    The ledger's publication row still points at rev1 while the live file
+    already holds the uncommitted rev2 bytes (旧发布修订对应新文件). Startup
+    must restore the published bytes and keep serving them until the
+    re-queued rev2 legitimately publishes.
+    """
+    srv = Server(tmp_path, demo_delay="0.1")
+    _legacy_data_dir(
+        srv.data_dir,
+        revisions=[
+            (1, DAY, 1, "published", "published"),
+            (2, DAY, 2, "ready", "ready"),
+        ],
+        publication=(DAY, 1, 4),
+        live_rows=CORRECTED_ROWS,   # uncommitted bytes already in place
+        rollback_rows=GOOD_ROWS,    # published bytes only in the backup
+    )
+    srv.start()
+    try:
+        dl = _http("GET", f"{srv.base}/download/{DAY}")
+        assert dl[0] == 200
+        assert _rain_mm(dl[1]) == GOOD_MM  # published rev1, not the rev2 bytes
+        status = json.loads(_http("GET", f"{srv.base}/status/{DAY}")[1])
+        assert status["current_publication"]["revision_id"] == 1
+        assert status["current_publication"]["partition_path"].endswith(
+            f"{DAY}-rev1.parquet"
+        )
+        # Uncommitted live file and the leftover backup are gone.
+        assert _partition_names(srv.data_dir) == {f"{DAY}-rev1.parquet"}
+        assert not list((srv.data_dir / "tmp" / "parquet").glob("rollback-*"))
+        events = [e["event"] for e in json.loads(_http("GET", f"{srv.base}/revisions/1/events")[1])]
+        assert "recovered" in events
+
+        # Newest unfinished revision continues; the switch happens only via
+        # a real recompute + commit.
+        _http("POST", f"{srv.base}/admin/resume")
+        final = _wait_terminal(srv.base, DAY)
+        assert final["latest_task"]["revision_id"] == 2
+        assert final["latest_task"]["status"] == "published"
+        assert _rain_mm(_http("GET", f"{srv.base}/download/{DAY}")[1]) == CORRECTED_MM
+    finally:
+        srv.stop()
+
+
+def test_legacy_window_renamed_away_missing_file_is_restored(tmp_path):
+    """Old code crashed between renaming the live file aside and replacing it.
+
+    The publication row pointed at a path that no longer existed (旧分区下载
+    404). Startup must bring the published partition back from the backup.
+    """
+    srv = Server(tmp_path, demo_delay="0.1")
+    _legacy_data_dir(
+        srv.data_dir,
+        revisions=[
+            (1, DAY, 1, "published", "published"),
+            (2, DAY, 2, "ready", "ready"),
+        ],
+        publication=(DAY, 1, 4),
+        live_rows=None,             # live path vanished: downloads were 404
+        rollback_rows=GOOD_ROWS,
+    )
+    srv.start()
+    try:
+        dl = _http("GET", f"{srv.base}/download/{DAY}")
+        assert dl[0] == 200
+        assert _rain_mm(dl[1]) == GOOD_MM
+        status = json.loads(_http("GET", f"{srv.base}/status/{DAY}")[1])
+        assert status["current_publication"]["revision_id"] == 1
+        assert _partition_names(srv.data_dir) == {f"{DAY}-rev1.parquet"}
+
+        _http("POST", f"{srv.base}/admin/resume")
+        final = _wait_terminal(srv.base, DAY)
+        assert final["latest_task"]["status"] == "published"
+        assert _rain_mm(_http("GET", f"{srv.base}/download/{DAY}")[1]) == CORRECTED_MM
+    finally:
+        srv.stop()
+
+
+def test_legacy_window_restore_falls_back_to_rollback_when_csv_missing(tmp_path):
+    """If the published revision's raw CSV is gone, the rollback backup is used."""
+    srv = Server(tmp_path, demo_delay="0.1")
+    _legacy_data_dir(
+        srv.data_dir,
+        revisions=[(1, DAY, 1, "published", "published")],
+        publication=(DAY, 1, 4),
+        live_rows=CORRECTED_ROWS,   # uncommitted bytes at the live path
+        rollback_rows=GOOD_ROWS,    # only on-disk copy of the published bytes
+        paused=False,
+    )
+    (srv.data_dir / "tmp" / "inputs" / f"{DAY}-r1.csv").unlink()
+    srv.start()
+    try:
+        dl = _http("GET", f"{srv.base}/download/{DAY}")
+        assert dl[0] == 200
+        assert _rain_mm(dl[1]) == GOOD_MM
+        status = json.loads(_http("GET", f"{srv.base}/status/{DAY}")[1])
+        assert status["current_publication"]["revision_id"] == 1
+        assert _partition_names(srv.data_dir) == {f"{DAY}-rev1.parquet"}
+    finally:
+        srv.stop()
+
+
+def test_legacy_window_committed_is_not_rolled_back(tmp_path):
+    """Old code crashed after the commit, leaving a stale rollback backup.
+
+    The live file already is the published rev2 content; recovery must keep
+    it (不得回退) and only migrate it to the immutable per-revision path.
+    """
+    srv = Server(tmp_path, demo_delay="0.1")
+    _legacy_data_dir(
+        srv.data_dir,
+        revisions=[
+            (1, DAY, 1, "published", "published"),
+            (2, DAY, 2, "published", "published"),
+        ],
+        publication=(DAY, 2, 4),
+        live_rows=CORRECTED_ROWS,   # committed content
+        rollback_rows=GOOD_ROWS,    # stale backup of the previous partition
+        paused=False,
+    )
+    srv.start()
+    try:
+        dl = _http("GET", f"{srv.base}/download/{DAY}")
+        assert dl[0] == 200
+        assert _rain_mm(dl[1]) == CORRECTED_MM  # not rolled back to rev1 bytes
+        status = json.loads(_http("GET", f"{srv.base}/status/{DAY}")[1])
+        assert status["current_publication"]["revision_id"] == 2
+        assert status["current_publication"]["partition_path"].endswith(
+            f"{DAY}-rev2.parquet"
+        )
+        assert status["latest_task"]["status"] == "published"
+        assert status["worker_active"] is False
+        assert _partition_names(srv.data_dir) == {f"{DAY}-rev2.parquet"}
+        assert not list((srv.data_dir / "tmp" / "parquet").glob("rollback-*"))
+        events = [e["event"] for e in json.loads(_http("GET", f"{srv.base}/revisions/2/events")[1])]
+        assert "migrated" in events
+    finally:
+        srv.stop()

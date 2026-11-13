@@ -83,5 +83,23 @@ class KillResponse(BaseModel):
     message: str
 
 
+class CrashPoint(str, Enum):
+    """Publish-switch points where a one-shot hard crash can be armed."""
+
+    BEFORE_PUBLISH_COMMIT = "before_publish_commit"
+    AFTER_PUBLISH_COMMIT = "after_publish_commit"
+
+
+class CrashArmResponse(BaseModel):
+    armed: bool
+    point: str
+    armed_points: list[str]
+    message: str
+
+
+class CrashState(BaseModel):
+    armed_points: list[str]
+
+
 class ErrorResponse(BaseModel):
     detail: str

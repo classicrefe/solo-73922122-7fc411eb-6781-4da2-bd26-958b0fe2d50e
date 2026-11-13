@@ -11,6 +11,9 @@ GET    /download/{date}                  download the last successfully publishe
 POST   /admin/pause                      hold new pipeline stages
 POST   /admin/resume
 POST   /admin/revisions/{id}/kill        SIGKILL the live subprocess (demo)
+POST   /admin/crash/arm?point=...        arm a one-shot hard crash around the
+                                         publish commit (restart-recovery demo)
+GET    /admin/crash                      list armed crash points
 GET    /health
 """
 
@@ -21,13 +24,16 @@ from contextlib import asynccontextmanager
 from datetime import date as date_cls
 from pathlib import Path
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse
 
 from . import db
 from .config import MAX_UPLOAD_BYTES, settings
 from .pipeline import PipelineManager
 from .schemas import (
+    CrashArmResponse,
+    CrashPoint,
+    CrashState,
     EventOut,
     KillResponse,
     PauseResponse,
@@ -250,6 +256,43 @@ async def kill(revision_id: int):
         killed=True,
         message="SIGKILL delivered; the revision will be marked failed",
     )
+
+
+@app.post(
+    "/admin/crash/arm",
+    response_model=CrashArmResponse,
+    summary="Arm a one-shot hard crash around the publish commit (restart demo)",
+)
+async def arm_crash(
+    point: CrashPoint = Query(
+        ...,
+        description=(
+            "before_publish_commit: new partition file renamed into place, "
+            "publication row not yet committed. after_publish_commit: "
+            "publication row committed, superseded file not yet retired."
+        ),
+    ),
+):
+    manager.arm_crash(point.value)
+    return CrashArmResponse(
+        armed=True,
+        point=point.value,
+        armed_points=manager.armed_crash_points(),
+        message=(
+            "the next publish reaching this point hard-exits the process "
+            "(os._exit, no cleanup); restart the container to watch recovery. "
+            "One-shot: the restarted process comes back disarmed."
+        ),
+    )
+
+
+@app.get(
+    "/admin/crash",
+    response_model=CrashState,
+    summary="List currently armed crash points",
+)
+async def crash_state():
+    return CrashState(armed_points=manager.armed_crash_points())
 
 
 @app.get("/health", summary="Liveness probe")

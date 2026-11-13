@@ -69,7 +69,10 @@ def connect() -> sqlite3.Connection:
             )
             conn.row_factory = sqlite3.Row
             conn.execute("PRAGMA journal_mode=WAL")
-            conn.execute("PRAGMA synchronous=NORMAL")
+            # FULL: a committed publication row must survive a process kill.
+            # The ledger is tiny and written infrequently, so the fsync per
+            # commit is cheap insurance for the publish-switch guarantee.
+            conn.execute("PRAGMA synchronous=FULL")
             conn.execute("PRAGMA busy_timeout=5000")
             conn.execute("PRAGMA foreign_keys=ON")
             conn.executescript(SCHEMA)
@@ -169,6 +172,14 @@ def get_revision(revision_id: int) -> dict[str, Any] | None:
     return dict(row) if row else None
 
 
+def get_revision_by_date_seq(date: str, seq: int) -> dict[str, Any] | None:
+    with _lock:
+        row = connect().execute(
+            "SELECT * FROM revisions WHERE date = ? AND seq = ?", (date, seq)
+        ).fetchone()
+    return dict(row) if row else None
+
+
 def list_revisions(date: str) -> list[dict[str, Any]]:
     with _lock:
         rows = connect().execute(
@@ -236,8 +247,10 @@ def mark_failed_if_active(revision_id: int, stage: str, error: str) -> bool:
 def set_published(revision_id: int, date: str, partition_path: str, row_count: int) -> bool:
     """Conditional publish: succeeds only if the revision is still active.
 
-    The filesystem swap happens *before* this call; when it returns False the
-    caller restores the previous partition.
+    The new partition file already sits at its final immutable path when this
+    is called; the commit below is the single atomic pointer switch. When it
+    returns False the caller unlinks the never-committed file — the previous
+    publication's file is never touched either way.
     """
     with tx() as conn:
         row = conn.execute(
@@ -273,6 +286,21 @@ def get_publication(date: str) -> dict[str, Any] | None:
             "SELECT * FROM publications WHERE date = ?", (date,)
         ).fetchone()
     return dict(row) if row else None
+
+
+def list_publications() -> list[dict[str, Any]]:
+    with _lock:
+        rows = connect().execute("SELECT * FROM publications ORDER BY date").fetchall()
+    return [dict(r) for r in rows]
+
+
+def update_publication_path(date: str, partition_path: str) -> None:
+    """Repoint a publication at its migrated partition file (startup recovery)."""
+    with tx() as conn:
+        conn.execute(
+            "UPDATE publications SET partition_path = ? WHERE date = ?",
+            (partition_path, date),
+        )
 
 
 def list_events(revision_id: int) -> list[dict[str, Any]]:

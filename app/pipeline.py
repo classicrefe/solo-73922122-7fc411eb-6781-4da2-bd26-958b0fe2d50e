@@ -9,9 +9,25 @@ Concurrency model
 * A revision re-checks the ledger before every stage and before publishing.
   A revision that was cancelled (superseded, restart, ...) stops immediately,
   so a late-finishing subprocess can never be published.
-* The partition file is swapped into place atomically and the publication row
-  is committed in the same guarded transition; any failure leaves the
-  previously published partition untouched and downloadable.
+
+Crash-safe publication
+----------------------
+Every revision publishes to its own immutable file
+(``partitions/<date>-rev<id>.parquet``). The ledger commit that repoints the
+publication row is the single atomic switch; the previously published file is
+never renamed or deleted before that commit. A crash therefore lands in one
+of two safe states:
+
+* after the file rename but before the commit — the ledger still points at
+  the previous partition, which is untouched and keeps being served; the
+  never-committed file is an orphan that startup garbage collection removes;
+* after the commit — the ledger points at the new file, which is already
+  durable; there is nothing to roll back.
+
+Startup recovery additionally migrates data directories left by the old
+in-place-swap implementation (including its crash windows: a renamed-away or
+replaced live file whose publish never committed) back to a state where the
+served bytes match the publication row.
 """
 
 from __future__ import annotations
@@ -20,6 +36,7 @@ import asyncio
 import contextlib
 import json
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -30,6 +47,11 @@ CLEAN_SCRIPT = Path(__file__).parent / "subprocs" / "clean.py"
 ENCODE_SCRIPT = Path(__file__).parent / "subprocs" / "encode.py"
 
 TERMINAL_STATUSES = {"published", "cancelled", "failed"}
+
+# Backups created by the old in-place-swap implementation.
+LEGACY_ROLLBACK_RE = re.compile(
+    r"rollback-(?P<date>\d{4}-\d{2}-\d{2})-r(?P<seq>\d+)\.parquet"
+)
 
 
 class RevisionCancelled(RuntimeError):
@@ -44,7 +66,18 @@ def _fsync_dir(path: Path) -> None:
         os.close(fd)
 
 
+def _fsync_file(path: Path) -> None:
+    fd = os.open(str(path), os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
 class PipelineManager:
+    # Points at which a one-shot hard crash can be armed for the restart demo.
+    CRASH_POINTS = frozenset({"before_publish_commit", "after_publish_commit"})
+
     def __init__(self) -> None:
         # date -> serial queue; each date gets one long-lived worker task.
         self._queues: dict[str, asyncio.Queue[int]] = {}
@@ -52,6 +85,8 @@ class PipelineManager:
         # revision id -> handle of its currently running subprocess.
         self._processes: dict[int, asyncio.subprocess.Process] = {}
         self._procs_lock = asyncio.Lock()
+        # Armed crash points (one-shot; a restart comes back disarmed).
+        self._crash_points: set[str] = set()
 
     # ------------------------------------------------------------------ lifecycle
     async def start(self) -> None:
@@ -85,12 +120,174 @@ class PipelineManager:
 
     # ------------------------------------------------------------------ recovery
     async def _recover(self) -> None:
-        """Re-queue the newest unfinished revision per date after a restart.
+        """Restore a consistent state, then re-queue unfinished work.
 
-        Nothing ever auto-publishes at boot: unfinished work is redone from the
-        retained raw CSV, and older revisions that were already superseded are
-        discarded instead of being resurrected.
+        Order matters: legacy migration reads the old rollback backups from
+        the staging directory, transient directories are wiped afterwards,
+        unreferenced partition files are garbage-collected next, and only
+        then is the newest unfinished revision per date re-queued. Nothing
+        ever auto-publishes at boot: unfinished work is redone from the
+        retained raw CSV, and older revisions that were already superseded
+        are discarded instead of being resurrected.
         """
+        await self._migrate_legacy_layout()
+        self._wipe_transient_dirs()
+        self._gc_unreferenced_partitions()
+        self._requeue_unfinished()
+
+    async def _migrate_legacy_layout(self) -> None:
+        """Repair data dirs left by the old in-place-swap implementation.
+
+        The old code renamed the live partition aside
+        (``tmp/parquet/rollback-<date>-r<seq>.parquet``) and moved the new
+        file over ``partitions/<date>.parquet`` *before* committing the
+        publication row. A crash in that window left the ledger pointing at
+        bytes of a different revision (``旧发布修订对应新文件``) or at a file
+        that no longer exists (``旧分区下载 404``). For every publication
+        still using the legacy path:
+
+        * a *foreign* rollback backup (belonging to a revision that is not
+          the published one) proves the live file was swapped without a
+          commit — the published partition is rebuilt from the published
+          revision's retained raw CSV, falling back to the newest foreign
+          backup, and the uncommitted live file is discarded;
+        * otherwise the live file is known to match the publication row and
+          is simply moved to its immutable per-revision path;
+        * the publication row is then repointed at the migrated file.
+        """
+        for pub in db.list_publications():
+            date = pub["date"]
+            legacy_path = settings.legacy_partition_path(date)
+            if pub["partition_path"] != str(legacy_path):
+                continue  # already on the immutable per-revision layout
+            pub_rev_id = int(pub["revision_id"])
+            new_path = settings.partition_path(date, pub_rev_id)
+
+            def _event(event: str, detail: str) -> None:
+                # A hand-built or partially corrupted legacy ledger may
+                # reference a missing revision; events are best-effort.
+                if db.get_revision(pub_rev_id) is not None:
+                    db.add_event(pub_rev_id, event, detail)
+
+            foreign: list[tuple[int, Path]] = []
+            for p in settings.staged_dir.glob(f"rollback-{date}-r*.parquet"):
+                m = LEGACY_ROLLBACK_RE.fullmatch(p.name)
+                if not m:
+                    continue
+                seq = int(m.group("seq"))
+                rev = db.get_revision_by_date_seq(date, seq)
+                if rev is None or int(rev["id"]) != pub_rev_id:
+                    foreign.append((seq, p))
+            foreign.sort()
+
+            restored = False
+            if foreign:
+                # The live file (if any) holds bytes of a revision that never
+                # committed: discard it and restore exactly what the
+                # publication row refers to.
+                with contextlib.suppress(FileNotFoundError):
+                    legacy_path.unlink()
+                restored = await self._rebuild_published_partition(pub_rev_id, new_path)
+                if not restored:
+                    # Newest crashed attempt's backup is the best on-disk
+                    # copy of the published bytes.
+                    os.replace(foreign[-1][1], new_path)
+                    restored = True
+                _event(
+                    "recovered",
+                    "published partition restored after a pre-commit crash "
+                    "of a later revision (legacy layout)",
+                )
+            elif legacy_path.exists():
+                os.replace(legacy_path, new_path)
+                restored = True
+                _event(
+                    "migrated",
+                    "legacy partition moved to immutable per-revision path",
+                )
+            else:
+                _event(
+                    "missing",
+                    "published partition file not found during recovery",
+                )
+            if restored:
+                _fsync_dir(settings.partition_dir)
+                db.update_publication_path(date, str(new_path))
+
+        # Rollback backups are only meaningful to the migration above; any
+        # that remain are stale (e.g. the publish had in fact committed).
+        for p in settings.staged_dir.glob("rollback-*.parquet"):
+            with contextlib.suppress(FileNotFoundError):
+                p.unlink()
+
+    async def _rebuild_published_partition(
+        self, revision_id: int, new_path: Path
+    ) -> bool:
+        """Recompute a published revision's partition from its retained CSV."""
+        rev = db.get_revision(revision_id)
+        if rev is None:
+            return False
+        input_path = Path(rev["input_path"])
+        if not input_path.exists():
+            return False
+        arrow = settings.work_dir / f"recover-rev{revision_id}.arrow"
+        staged = settings.staged_dir / f"recover-rev{revision_id}.parquet"
+        try:
+            await self._run_subprocess(
+                revision_id,
+                [
+                    str(CLEAN_SCRIPT),
+                    str(input_path),
+                    str(arrow),
+                    rev["date"],
+                    str(revision_id),
+                ],
+                "recovery-clean",
+            )
+            await self._run_subprocess(
+                revision_id,
+                [str(ENCODE_SCRIPT), str(arrow), str(staged), str(revision_id)],
+                "recovery-encode",
+            )
+            _fsync_file(staged)
+            os.replace(staged, new_path)
+            return True
+        except Exception:  # noqa: BLE001 - fall back to the rollback backup
+            return False
+        finally:
+            for p in (arrow, staged):
+                with contextlib.suppress(FileNotFoundError):
+                    p.unlink()
+
+    def _wipe_transient_dirs(self) -> None:
+        """Remove half-written Arrow/Parquet artefacts from before the crash.
+
+        Raw uploaded CSVs are kept: unfinished revisions are rebuilt from
+        them. Nothing is in flight yet when this runs.
+        """
+        for directory in (settings.work_dir, settings.staged_dir):
+            for p in directory.iterdir():
+                if p.is_file():
+                    with contextlib.suppress(FileNotFoundError):
+                        p.unlink()
+
+    def _gc_unreferenced_partitions(self) -> None:
+        """Delete partition files no publication row points at.
+
+        This is what makes the publish window crash-safe: a file that was
+        renamed into place but never committed is garbage-collected, while
+        the file the ledger points at is never removed — so downloads keep
+        serving exactly the current publication during recovery, instead of
+        being switched off to hide the inconsistency.
+        """
+        referenced = {row["partition_path"] for row in db.list_publications()}
+        for p in settings.partition_dir.iterdir():
+            if p.is_file() and str(p) not in referenced:
+                with contextlib.suppress(FileNotFoundError):
+                    p.unlink()
+
+    def _requeue_unfinished(self) -> None:
+        """Re-queue the newest unfinished revision per date after a restart."""
         open_revs = db.non_terminal_revisions()
         by_date: dict[str, list[dict]] = {}
         for rev in open_revs:
@@ -108,13 +305,6 @@ class PipelineManager:
                     error="superseded before API restart; not resumed",
                 )
                 db.add_event(rev["id"], "cancelled", "stale revision discarded at restart")
-            # Remove partial artefacts; the raw CSV stays for an audit trail.
-            for path in (
-                settings.work_arrow_path(newest["id"]),
-                settings.staged_parquet_path(newest["id"]),
-            ):
-                with contextlib.suppress(FileNotFoundError):
-                    path.unlink()
             db.reset_for_recovery(newest["id"])
             self.submit(date, newest["id"])
 
@@ -249,7 +439,7 @@ class PipelineManager:
             db.update_revision(revision_id, stage="ready", row_count=row_count)
             db.add_event(revision_id, "encoded", f"{row_count} rows staged")
 
-            # Stage 3: publication gate + atomic swap + guarded commit.
+            # Stage 3: publication gate + atomic pointer switch.
             await self._gate(revision_id, "publishing")
             db.update_revision(revision_id, status="ready", stage="ready")
             db.add_event(revision_id, "ready", "staged file awaits publication")
@@ -257,34 +447,36 @@ class PipelineManager:
             if rev is None or rev["status"] != "ready":
                 raise RevisionCancelled("revision left ready state before publish")
 
-            target = settings.partition_path(date)
-            # Keep the currently served file (if any) so the swap can be fully
-            # rolled back when the ledger rejects the publication.
-            backup: Path | None = None
-            if target.exists():
-                backup = settings.staged_dir / f"rollback-{date}-r{rev['seq']}.parquet"
-                with contextlib.suppress(FileNotFoundError):
-                    backup.unlink()
-                os.replace(target, backup)
-            try:
-                os.replace(staged_path, target)
-                _fsync_dir(settings.partition_dir)
+            final_path = settings.partition_path(date, revision_id)
+            previous = db.get_publication(date)
+            previous_path = Path(previous["partition_path"]) if previous else None
 
-                if not db.set_published(revision_id, date, str(target), row_count):
-                    raise RevisionCancelled("publication rejected by ledger guard")
-            except BaseException:
-                # Restore the previous partition; never leave a half-swapped
-                # file or expose the losing revision's bytes.
-                with contextlib.suppress(FileNotFoundError):
-                    target.unlink()
-                if backup is not None:
-                    os.replace(backup, target)
-                _fsync_dir(settings.partition_dir)
-                raise
+            # Durable immutable artefact first, ledger pointer second. The
+            # currently published file is never renamed or deleted before the
+            # commit, so a crash anywhere in this window keeps downloads
+            # serving exactly what the publication row says.
+            _fsync_file(staged_path)
+            os.replace(staged_path, final_path)
+            _fsync_dir(settings.partition_dir)
+            self._maybe_crash("before_publish_commit")
 
-            if backup is not None:
+            if not db.set_published(revision_id, date, str(final_path), row_count):
+                # Superseded while publishing: drop the never-committed file;
+                # the previous publication stays fully intact.
                 with contextlib.suppress(FileNotFoundError):
-                    backup.unlink()
+                    final_path.unlink()
+                raise RevisionCancelled("publication rejected by ledger guard")
+            db.add_event(revision_id, "switched", f"publication now at {final_path.name}")
+            self._maybe_crash("after_publish_commit")
+
+            # Committed — retire the superseded partition file. A crash
+            # before this unlink only leaves an orphan that the startup
+            # garbage collector removes; never roll the pointer back.
+            if previous_path is not None and previous_path != final_path:
+                with contextlib.suppress(FileNotFoundError):
+                    previous_path.unlink()
+                with contextlib.suppress(OSError):
+                    _fsync_dir(settings.partition_dir)
             with contextlib.suppress(FileNotFoundError):
                 arrow_path.unlink()
 
@@ -302,6 +494,27 @@ class PipelineManager:
                 db.add_event(revision_id, "aborted", f"after termination: {exc}")
 
     # ------------------------------------------------------------------ admin
+    def arm_crash(self, point: str) -> None:
+        """Arm a one-shot hard crash at a publish switch point (demo)."""
+        if point not in self.CRASH_POINTS:
+            raise ValueError(
+                f"unknown crash point {point!r}; choose from {sorted(self.CRASH_POINTS)}"
+            )
+        self._crash_points.add(point)
+
+    def armed_crash_points(self) -> list[str]:
+        return sorted(self._crash_points)
+
+    def _maybe_crash(self, point: str) -> None:
+        """Hard-exit the process if this point is armed (power-loss demo).
+
+        ``os._exit`` skips every cleanup path on purpose — this simulates the
+        API dying mid-switch. The arm is in-memory, so the restarted process
+        comes back disarmed and recovery can be observed uninterrupted.
+        """
+        if point in self._crash_points:
+            os._exit(1)
+
     async def force_kill(self, revision_id: int) -> bool:
         """SIGKILL the revision's live subprocess (admin demo)."""
         async with self._procs_lock:
